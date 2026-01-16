@@ -1,0 +1,530 @@
+"""
+סורק פייסבוק אוטומטי עם Playwright
+כולל טכניקות הסוואה למניעת זיהוי
+"""
+
+import asyncio
+import random
+from datetime import datetime
+from typing import List, Dict, Optional
+
+from playwright.async_api import async_playwright, Page, Browser
+from playwright_stealth import Stealth
+
+import config
+from database import get_db
+from candidatMatcher import get_matcher
+from responseGenerator import get_generator
+
+
+class FacebookScraper:
+    """סורק קבוצות פייסבוק ומגיב למועמדים"""
+    
+    def __init__(self):
+        self.db = get_db()
+        self.matcher = get_matcher()
+        self.generator = get_generator()
+        self.browser: Optional[Browser] = None
+        self.page: Optional[Page] = None
+        self.is_logged_in = False
+    
+    async def start(self):
+        """הפעלת הדפדפן והתחברות"""
+        playwright = await async_playwright().start()
+
+        # נתיב לשמירת הסשן
+        user_data_dir = config.DATA_DIR / "browser_session"
+        user_data_dir.mkdir(exist_ok=True)
+
+        print(f"💾 משתמש בסשן שמור: {user_data_dir}")
+
+        # פתיחת דפדפן עם persistent context (שומר cookies וסשן)
+        context = await playwright.chromium.launch_persistent_context(
+            user_data_dir=str(user_data_dir),
+            headless=config.BROWSER_SETTINGS['headless'],
+            slow_mo=config.BROWSER_SETTINGS['slow_mo'],
+            viewport=config.BROWSER_SETTINGS['viewport'],
+            user_agent=config.BROWSER_SETTINGS['user_agent']
+        )
+
+        self.browser = context.browser
+        self.page = context.pages[0] if context.pages else await context.new_page()
+
+        # החלת טכניקות הסוואה
+        stealth = Stealth()
+        await stealth.apply_stealth_async(self.page)
+
+        print("✅ דפדפן הופעל בהצלחה")
+    
+    async def login_to_facebook(self):
+        """התחברות לפייסבוק"""
+        try:
+            print("🔐 בודק התחברות לפייסבוק...")
+
+            # מעבר לפייסבוק (domcontentloaded מהיר יותר מ-networkidle)
+            await self.page.goto('https://www.facebook.com/', wait_until='domcontentloaded', timeout=60000)
+            await self.human_delay(3, 5)
+
+            # בדיקה אם כבר מחוברים - חיפוש סימנים שונים
+            print("🔍 בודק אם כבר מחובר...")
+
+            # אם אנחנו בדף הבית של פייסבוק (לא בדף login), כנראה שמחוברים
+            current_url = self.page.url
+            if 'login' not in current_url.lower() and 'facebook.com' in current_url:
+                print("✅ כבר מחובר לפייסבוק!")
+                self.is_logged_in = True
+                return True
+            
+            # אם לא מחוברים - מציע התחברות ידנית
+            print("\n" + "="*60)
+            print("⚠️  לא מחובר לפייסבוק!")
+            print("="*60)
+            print("\n📝 אפשרויות:")
+            print("   1. התחבר ידנית בחלון הדפדפן שנפתח")
+            print("   2. המתן 60 שניות לביצוע התחברות")
+            print("   3. הבוט ימשיך אוטומטית לאחר ההתחברות\n")
+            print("⏳ ממתין להתחברות ידנית...")
+            print("   (יש לך 60 שניות להתחבר)\n")
+
+            # ממתין עד 60 שניות שהמשתמש יתחבר ידנית
+            for i in range(60):
+                await asyncio.sleep(1)
+                current_url = self.page.url
+
+                # בדיקה אם המשתמש התחבר
+                if 'login' not in current_url.lower():
+                    print(f"\n✅ התחברות הצליחה! (אחרי {i+1} שניות)")
+                    self.is_logged_in = True
+                    await self.human_delay(2, 3)
+                    return True
+
+                # הדפסת נקודות התקדמות
+                if (i + 1) % 10 == 0:
+                    print(f"   ... עדיין ממתין ({60-i-1} שניות נותרו)")
+
+            print("\n❌ פג זמן ההתחברות - נסה שוב")
+            return False
+                
+        except Exception as e:
+            print(f"❌ שגיאה בהתחברות: {e}")
+            self.db.log_error("login_error", str(e), "התחברות לפייסבוק")
+            return False
+    
+    async def scan_group(self, group_info: Dict) -> List[Dict]:
+        """
+        סריקת קבוצה ספציפית
+        
+        Returns:
+            list: רשימת פוסטים שנמצאו
+        """
+        group_name = group_info['name']
+        group_url = group_info['url']
+        
+        if not group_url:
+            print(f"⚠️ אין URL לקבוצה {group_name}")
+            return []
+        
+        print(f"\n🔍 סורק קבוצה: {group_name}")
+        
+        try:
+            # מעבר לקבוצה (domcontentloaded מהיר ויציב יותר)
+            await self.page.goto(group_url, wait_until='domcontentloaded', timeout=60000)
+            await self.human_delay(5, 7)  # זמן נוסף לטעינת הפוסטים
+            
+            # גלילה למטה כמה פעמים לטעינת פוסטים
+            posts_to_scan = config.AUTOMATION_SETTINGS['posts_to_scan_per_group']
+            print(f"📜 גולל למטה לטעינת {posts_to_scan} פוסטים...")
+            for i in range(10):  # 10 גלילות כדי לטעון ~50 פוסטים
+                await self.scroll_naturally()
+                await self.human_delay(2, 4)
+                if (i + 1) % 2 == 0:
+                    print(f"   טעון פוסטים... ({i+1}/10 גלילות)")
+            
+            # חילוץ פוסטים
+            posts = await self.extract_posts_from_page(group_name, posts_to_scan)
+            
+            print(f"✅ נמצאו {len(posts)} פוסטים בקבוצה")
+            
+            # עדכון סטטיסטיקות
+            self.db.update_daily_stats(posts_scanned=len(posts))
+            
+            return posts
+            
+        except Exception as e:
+            print(f"❌ שגיאה בסריקת קבוצה {group_name}: {e}")
+            self.db.log_error("scan_error", str(e), f"סריקת קבוצה: {group_name}")
+            self.db.update_daily_stats(errors=1)
+            return []
+    
+    async def extract_posts_from_page(self, group_name: str, max_posts: int) -> List[Dict]:
+        """חילוץ פוסטים מהעמוד הנוכחי"""
+        posts = []
+        
+        try:
+            # מציאת כל הפוסטים בעמוד
+            # שים לב: הסלקטורים של פייסבוק משתנים - אלו הם גנריים
+            post_elements = await self.page.locator('[role="article"]').all()
+            
+            for i, post_element in enumerate(post_elements[:max_posts]):
+                try:
+                    # חילוץ טקסט הפוסט
+                    post_text = await post_element.inner_text()
+                    
+                    # דילוג על פוסטים קצרים מדי
+                    if len(post_text) < 10:
+                        continue
+                    
+                    # יצירת ID ייחודי לפוסט (hash של הטקסט + תאריך)
+                    post_id = f"{group_name}_{hash(post_text)}_{datetime.now().date()}"
+                    
+                    # בדיקה אם כבר עיבדנו את הפוסט הזה
+                    if self.db.is_post_processed(post_id):
+                        continue
+                    
+                    # נסיון לחלץ שם מחבר (אופציונלי)
+                    author_name = ""
+                    try:
+                        # נסיון מספר 1: חיפוש קישור עם התפקיד link
+                        author_element = await post_element.locator('a[role="link"]').first.inner_text()
+                        author_name = author_element.strip()
+                    except:
+                        try:
+                            # נסיון מספר 2: השורה הראשונה בפוסט (לרוב השם)
+                            first_line = post_text.split('\n')[0].strip()
+                            if len(first_line) < 50:  # אם זה קצר, כנראה שזה שם
+                                author_name = first_line
+                        except:
+                            pass
+                    
+                    # יצירת אובייקט פוסט
+                    post = {
+                        'post_id': post_id,
+                        'group_name': group_name,
+                        'author_name': author_name,
+                        'post_text': post_text,
+                        'post_url': self.page.url,
+                        'posted_at': datetime.now().isoformat(),
+                        'element': post_element  # שמירת האלמנט לשימוש מאוחר יותר
+                    }
+                    
+                    posts.append(post)
+                    
+                except Exception as e:
+                    print(f"⚠️ שגיאה בחילוץ פוסט #{i}: {e}")
+                    continue
+            
+        except Exception as e:
+            print(f"❌ שגיאה בחילוץ פוסטים: {e}")
+        
+        return posts
+    
+    async def process_and_respond_to_posts(self, posts: List[Dict]):
+        """עיבוד והגבה לפוסטים"""
+        candidates_found = 0
+        responses_sent = 0
+        
+        for post in posts:
+            try:
+                # ניתוח הפוסט
+                analysis = self.matcher.analyze_post(
+                    post['post_text'],
+                    post.get('author_name', ''),
+                    post.get('posted_at')
+                )
+                
+                # שמירה במסד נתונים
+                post_data = {
+                    **post,
+                    'is_candidate': analysis['is_candidate'],
+                    'candidate_score': analysis['candidate_score'],
+                    'matched_keywords': analysis.get('matched_keywords', [])
+                }
+                self.db.add_scanned_post(post_data)
+                
+                # אם זה לא מועמד, ממשיכים הלאה
+                if not analysis['is_candidate']:
+                    continue
+                
+                candidates_found += 1
+                print(f"\n✅ מצאנו מועמד! ציון: {analysis['candidate_score']:.1f}/10")
+                print(f"   מחבר: {post.get('author_name', 'לא ידוע')}")
+                print(f"   טקסט: {post['post_text'][:100]}...")
+                
+                # בדיקה אם צריך לענות
+                if not analysis['should_respond']:
+                    print(f"   ⏭️ לא עונים: {analysis['reason']}")
+                    continue
+                
+                # בדיקת מגבלות יומיות
+                daily_count = self.db.get_daily_response_count()
+                max_daily = config.AUTOMATION_SETTINGS['max_responses_per_day']
+                
+                if daily_count >= max_daily:
+                    print(f"   ⏸️ הגענו למגבלה היומית ({max_daily} תגובות)")
+                    break
+                
+                # בדיקה אם כבר הגבנו לפוסט זה
+                if self.db.has_responded_to_post(post['post_id']):
+                    print("   ⏭️ כבר הגבנו לפוסט זה")
+                    continue
+                
+                # יצירת תגובה
+                response = await self.create_and_send_response(post, analysis)
+                
+                if response:
+                    responses_sent += 1
+                    print("   ✅ תגובה נשלחה בהצלחה!")
+                    
+                    # עיכוב אקראי בין תגובות
+                    delay = random.randint(
+                        config.AUTOMATION_SETTINGS['delay_between_responses_min'],
+                        config.AUTOMATION_SETTINGS['delay_between_responses_max']
+                    )
+                    print(f"   ⏳ ממתין {delay} שניות לפני התגובה הבאה...")
+                    await asyncio.sleep(delay)
+                    
+            except Exception as e:
+                print(f"❌ שגיאה בעיבוד פוסט: {e}")
+                self.db.log_error("process_error", str(e), post.get('post_id', ''))
+                continue
+        
+        # עדכון סטטיסטיקות
+        self.db.update_daily_stats(
+            candidates_found=candidates_found,
+            responses_sent=responses_sent
+        )
+        
+        print(f"\n📊 סיכום: {candidates_found} מועמדים, {responses_sent} תגובות נשלחו")
+    
+    async def create_and_send_response(self, post: Dict, analysis: Dict) -> bool:
+        """יצירה ושליחת תגובה"""
+        try:
+            # יצירת התגובה
+            candidate_info = analysis.get('candidate_info', {})
+            matched_job = analysis.get('matched_job')
+
+            if not matched_job:
+                return False
+
+            response_text = self.generator.generate_response(
+                candidate_info,
+                matched_job,
+                post.get('author_name', '')
+            )
+
+            # הוספת נגיעה אישית
+            response_text = self.generator.add_personal_touch(response_text, candidate_info)
+
+            print(f"\n💬 תגובה שתישלח:")
+            print(f"   {response_text}\n")
+
+            # שליחת התגובה (אם יש element)
+            if 'element' in post:
+                # צילום מסך לפני הניסיון
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                screenshot_dir = config.DATA_DIR / "screenshots"
+                screenshot_dir.mkdir(exist_ok=True)
+
+                try:
+                    screenshot_before = screenshot_dir / f"before_{timestamp}.png"
+                    await post['element'].screenshot(path=str(screenshot_before))
+                    print(f"   📸 צילום מסך נשמר: {screenshot_before.name}")
+                except:
+                    pass  # אם לא הצליח - לא נורא
+
+                # גלילה לאלמנט כדי לוודא שהוא נראה
+                try:
+                    await post['element'].scroll_into_view_if_needed(timeout=5000)
+                    await self.human_delay(0.5, 1)
+                except:
+                    pass
+
+                # אסטרטגיה חדשה: חיפוש של כל תיבות טקסט עריכה בפוסט
+                comment_box = None
+                successful_method = None
+
+                print("   🔍 מחפש תיבת תגובה...")
+
+                # שיטה 1: חפש תיבת טקסט עריכה (contenteditable)
+                try:
+                    print(f"      ניסיון 1: חיפוש div[contenteditable=true]")
+                    # מצא את כל אלמנטים עריכים בתוך הפוסט
+                    all_editables = post['element'].locator('div[contenteditable="true"]').all()
+                    editables_list = await all_editables
+
+                    if len(editables_list) > 0:
+                        print(f"      נמצאו {len(editables_list)} אלמנטים עריכים")
+                        # נסה את הראשון
+                        comment_box = editables_list[0]
+                        await comment_box.scroll_into_view_if_needed(timeout=2000)
+                        await comment_box.click(timeout=3000)
+                        successful_method = f"contenteditable (1/{len(editables_list)})"
+                        print(f"   ✅ תיבת תגובה נמצאה! (שיטה: {successful_method})")
+                    else:
+                        print("      ❌ לא נמצאו אלמנטים עריכים")
+                except Exception as e:
+                    print(f"      ❌ נכשל: {str(e)[:80]}")
+
+                # שיטה 2: חפש לפי role="textbox"
+                if not successful_method:
+                    try:
+                        print(f"      ניסיון 2: חיפוש div[role=textbox]")
+                        comment_box = post['element'].locator('div[role="textbox"]').first
+                        await comment_box.scroll_into_view_if_needed(timeout=2000)
+                        await comment_box.wait_for(state='visible', timeout=2000)
+                        await comment_box.click(timeout=3000)
+                        successful_method = "role=textbox"
+                        print(f"   ✅ תיבת תגובה נמצאה! (שיטה: {successful_method})")
+                    except Exception as e:
+                        print(f"      ❌ נכשל: {str(e)[:80]}")
+
+                if not comment_box or not successful_method:
+                    print("   ⚠️ לא נמצאה תיבת תגובה בכל השיטות, מדלג...")
+                    # צילום מסך כשנכשל
+                    try:
+                        screenshot_failed = screenshot_dir / f"failed_{timestamp}.png"
+                        await post['element'].screenshot(path=str(screenshot_failed))
+                        print(f"   📸 צילום מסך של כישלון נשמר: {screenshot_failed.name}")
+                    except:
+                        pass
+                    return False
+
+                # המתנה לוודא שתיבת התגובה מוכנה
+                await self.human_delay(1, 2)
+
+                # הקלדה אנושית
+                print("   ⌨️ מקליד את התגובה...")
+                await self.human_type(comment_box, response_text)
+                await self.human_delay(1, 1.5)
+
+                # לחיצה על Enter לשליחה
+                print("   📤 שולח תגובה...")
+                await comment_box.press('Enter')
+                await self.human_delay(3, 4)
+
+                # צילום מסך אחרי שליחה
+                try:
+                    screenshot_after = screenshot_dir / f"after_{timestamp}.png"
+                    await post['element'].screenshot(path=str(screenshot_after))
+                    print(f"   📸 צילום מסך אחרי שליחה: {screenshot_after.name}")
+                except:
+                    pass
+
+                # שמירת התגובה במסד הנתונים
+                response_data = {
+                    'post_id': post['post_id'],
+                    'response_text': response_text,
+                    'matched_job': matched_job['job_key'],
+                    'match_score': matched_job['match_score'],
+                    'status': 'sent'
+                }
+                self.db.add_response(response_data)
+
+                return True
+
+        except Exception as e:
+            print(f"❌ שגיאה בשליחת תגובה: {e}")
+            self.db.log_error("response_error", str(e), post.get('post_id', ''))
+
+            # צילום מסך של שגיאה
+            try:
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                screenshot_dir = config.DATA_DIR / "screenshots"
+                screenshot_dir.mkdir(exist_ok=True)
+                screenshot_error = screenshot_dir / f"error_{timestamp}.png"
+                if 'element' in post:
+                    await post['element'].screenshot(path=str(screenshot_error))
+                    print(f"   📸 צילום מסך של שגיאה: {screenshot_error.name}")
+            except:
+                pass
+
+            return False
+    
+    async def human_delay(self, min_sec: float, max_sec: float):
+        """עיכוב אקראי שנראה אנושי"""
+        delay = random.uniform(min_sec, max_sec)
+        await asyncio.sleep(delay)
+    
+    async def human_type(self, element, text: str):
+        """הקלדה שנראית אנושית עם מהירות משתנה"""
+        for char in text:
+            await element.type(char, delay=random.randint(50, 150))
+            
+            # סיכוי קטן לטעות ותיקון
+            if random.random() < 0.03:  # 3% סיכוי
+                # הקלדת תו שגוי
+                wrong_char = random.choice('abcdefghijklmnopqrstuvwxyz')
+                await element.type(wrong_char, delay=random.randint(50, 100))
+                await asyncio.sleep(0.2)
+                # תיקון - backspace
+                await element.press('Backspace')
+                await asyncio.sleep(0.1)
+            
+            # פעם בפעם - השהיית חשיבה
+            if random.random() < 0.10:  # 10% סיכוי
+                await asyncio.sleep(random.uniform(0.3, 1.0))
+    
+    async def scroll_naturally(self):
+        """גלילה שנראית טבעית"""
+        # גלילה בקטעים קטנים עם תנועת עכבר
+        for _ in range(random.randint(2, 4)):
+            scroll_amount = random.randint(300, 600)
+            await self.page.evaluate(f'window.scrollBy(0, {scroll_amount})')
+            await asyncio.sleep(random.uniform(0.3, 0.8))
+    
+    async def close(self):
+        """סגירת הדפדפן"""
+        if self.page:
+            await self.page.context.close()
+            print("✅ דפדפן נסגר (הסשן נשמר)")
+
+
+# פונקציה ראשית להרצה
+async def run_scan_session():
+    """הרצת סשן סריקה אחד"""
+    scraper = FacebookScraper()
+    
+    try:
+        # הפעלה והתחברות
+        await scraper.start()
+        
+        if not await scraper.login_to_facebook():
+            print("❌ לא הצלחנו להתחבר לפייסבוק")
+            return
+        
+        # סריקת כל הקבוצות
+        all_posts = []
+        for group_info in config.TARGET_GROUPS:
+            if not group_info.get('url'):
+                print(f"⚠️ דלג על קבוצה {group_info['name']} - אין URL")
+                continue
+            
+            posts = await scraper.scan_group(group_info)
+            all_posts.extend(posts)
+            
+            # עיכוב בין קבוצות
+            delay = random.randint(
+                config.AUTOMATION_SETTINGS['delay_between_groups_min'],
+                config.AUTOMATION_SETTINGS['delay_between_groups_max']
+            )
+            print(f"⏳ ממתין {delay} שניות לפני הקבוצה הבאה...")
+            await asyncio.sleep(delay)
+        
+        # עיבוד והגבה לכל הפוסטים
+        if all_posts:
+            await scraper.process_and_respond_to_posts(all_posts)
+        else:
+            print("⚠️ לא נמצאו פוסטים לעיבוד")
+        
+    except Exception as e:
+        print(f"❌ שגיאה כללית: {e}")
+        scraper.db.log_error("general_error", str(e), "run_scan_session")
+    
+    finally:
+        await scraper.close()
+
+
+if __name__ == "__main__":
+    # בדיקה מהירה
+    print("🚀 מפעיל בוט גיוס AIG...\n")
+    asyncio.run(run_scan_session())
