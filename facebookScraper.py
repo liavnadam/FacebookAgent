@@ -5,6 +5,7 @@
 
 import asyncio
 import random
+import hashlib
 from datetime import datetime
 from typing import List, Dict, Optional
 
@@ -129,16 +130,15 @@ class FacebookScraper:
         try:
             # מעבר לקבוצה (domcontentloaded מהיר ויציב יותר)
             await self.page.goto(group_url, wait_until='domcontentloaded', timeout=60000)
-            await self.human_delay(5, 7)  # זמן נוסף לטעינת הפוסטים
+            await self.human_delay(2, 3)  # זמן קצר לטעינת הפוסטים
             
             # גלילה למטה כמה פעמים לטעינת פוסטים
             posts_to_scan = config.AUTOMATION_SETTINGS['posts_to_scan_per_group']
             print(f"📜 גולל למטה לטעינת {posts_to_scan} פוסטים...")
-            for i in range(10):  # 10 גלילות כדי לטעון ~50 פוסטים
+            for i in range(5):  # 5 גלילות מהירות
                 await self.scroll_naturally()
-                await self.human_delay(2, 4)
-                if (i + 1) % 2 == 0:
-                    print(f"   טעון פוסטים... ({i+1}/10 גלילות)")
+                await self.human_delay(1, 2)
+                print(f"   טעון פוסטים... ({i+1}/5 גלילות)")
             
             # חילוץ פוסטים
             posts = await self.extract_posts_from_page(group_name, posts_to_scan)
@@ -174,8 +174,11 @@ class FacebookScraper:
                     if len(post_text) < 10:
                         continue
                     
-                    # יצירת ID ייחודי לפוסט (hash של הטקסט + תאריך)
-                    post_id = f"{group_name}_{hash(post_text)}_{datetime.now().date()}"
+                    post_url = await self.extract_post_url(post_element)
+                    posted_at = await self.extract_post_timestamp(post_element)
+
+                    # יצירת ID יציב לפוסט (URL אם קיים, אחרת hash יציב)
+                    post_id = self.build_post_id(group_name, post_text, post_url)
                     
                     # בדיקה אם כבר עיבדנו את הפוסט הזה
                     if self.db.is_post_processed(post_id):
@@ -202,8 +205,8 @@ class FacebookScraper:
                         'group_name': group_name,
                         'author_name': author_name,
                         'post_text': post_text,
-                        'post_url': self.page.url,
-                        'posted_at': datetime.now().isoformat(),
+                        'post_url': post_url or self.page.url,
+                        'posted_at': posted_at,
                         'element': post_element  # שמירת האלמנט לשימוש מאוחר יותר
                     }
                     
@@ -345,36 +348,96 @@ class FacebookScraper:
 
                 print("   🔍 מחפש תיבת תגובה...")
 
-                # שיטה 1: חפש תיבת טקסט עריכה (contenteditable)
+                # שיטה 0: לחץ על כפתור/אזור תגובה כדי לפתוח את תיבת התגובה
                 try:
-                    print(f"      ניסיון 1: חיפוש div[contenteditable=true]")
-                    # מצא את כל אלמנטים עריכים בתוך הפוסט
-                    all_editables = post['element'].locator('div[contenteditable="true"]').all()
-                    editables_list = await all_editables
+                    print("      ניסיון 0: לחיצה על אזור תגובות")
+                    # נסה מספר אפשרויות לפתוח את תיבת התגובה
+                    comment_area_selectors = [
+                        'div[aria-label*="תגובה"]',
+                        'div[aria-label*="Comment"]',
+                        'span:has-text("תגובה")',
+                        'div[aria-label*="Write"]',
+                        'div[aria-label*="כתוב"]',
+                        'form[role="presentation"]',  # Facebook comment form
+                        'div[data-visualcompletion="ignore-dynamic"]'  # Comment section container
+                    ]
+                    clicked = False
+                    for selector in comment_area_selectors:
+                        try:
+                            element = post['element'].locator(selector).first
+                            if await element.count() > 0:
+                                await element.click(timeout=2000)
+                                clicked = True
+                                print(f"      ✅ נלחץ על: {selector[:30]}")
+                                await self.human_delay(1, 1.5)
+                                break
+                        except:
+                            continue
+                    if not clicked:
+                        print("      ⚠️ לא נמצא אזור תגובות בפוסט")
+                except Exception as e:
+                    print(f"      ⚠️ שגיאה בלחיצה: {str(e)[:50]}")
+
+                # שיטה 1: חפש תיבת טקסט עריכה בתוך הפוסט (contenteditable)
+                try:
+                    print(f"      ניסיון 1: חיפוש div[contenteditable=true] בפוסט")
+                    editables_list = await post['element'].locator('div[contenteditable="true"]').all()
 
                     if len(editables_list) > 0:
                         print(f"      נמצאו {len(editables_list)} אלמנטים עריכים")
-                        # נסה את הראשון
                         comment_box = editables_list[0]
                         await comment_box.scroll_into_view_if_needed(timeout=2000)
                         await comment_box.click(timeout=3000)
                         successful_method = f"contenteditable (1/{len(editables_list)})"
                         print(f"   ✅ תיבת תגובה נמצאה! (שיטה: {successful_method})")
                     else:
-                        print("      ❌ לא נמצאו אלמנטים עריכים")
+                        print("      ❌ לא נמצאו אלמנטים עריכים בפוסט")
                 except Exception as e:
                     print(f"      ❌ נכשל: {str(e)[:80]}")
 
-                # שיטה 2: חפש לפי role="textbox"
+                # שיטה 2: חפש תיבת תגובה בכל העמוד (אחרי לחיצה על כפתור תגובה)
                 if not successful_method:
                     try:
-                        print(f"      ניסיון 2: חיפוש div[role=textbox]")
+                        print(f"      ניסיון 2: חיפוש תיבת תגובה פעילה בעמוד")
+                        # חפש תיבת טקסט עם placeholder של תגובה
+                        comment_box = self.page.locator('div[contenteditable="true"][aria-placeholder*="תגובה"], div[contenteditable="true"][aria-placeholder*="comment"], div[role="textbox"][aria-label*="תגובה"], div[role="textbox"][aria-label*="comment"]').first
+                        await comment_box.wait_for(state='visible', timeout=3000)
+                        await comment_box.click(timeout=3000)
+                        successful_method = "page-wide comment box"
+                        print(f"   ✅ תיבת תגובה נמצאה! (שיטה: {successful_method})")
+                    except Exception as e:
+                        print(f"      ❌ נכשל: {str(e)[:80]}")
+
+                # שיטה 3: חפש לפי role="textbox" בפוסט
+                if not successful_method:
+                    try:
+                        print(f"      ניסיון 3: חיפוש div[role=textbox] בפוסט")
                         comment_box = post['element'].locator('div[role="textbox"]').first
                         await comment_box.scroll_into_view_if_needed(timeout=2000)
                         await comment_box.wait_for(state='visible', timeout=2000)
                         await comment_box.click(timeout=3000)
                         successful_method = "role=textbox"
                         print(f"   ✅ תיבת תגובה נמצאה! (שיטה: {successful_method})")
+                    except Exception as e:
+                        print(f"      ❌ נכשל: {str(e)[:80]}")
+
+                # שיטה 4: נווט לעמוד הפוסט ותגיב שם
+                if not successful_method:
+                    try:
+                        print(f"      ניסיון 4: ניווט לעמוד הפוסט")
+                        post_url = post.get('post_url')
+                        if post_url and 'facebook.com' in post_url:
+                            await self.page.goto(post_url, wait_until='domcontentloaded', timeout=30000)
+                            await self.human_delay(2, 3)
+
+                            # חפש תיבת תגובה בעמוד הפוסט
+                            comment_box = self.page.locator('div[contenteditable="true"][aria-label*="תגובה"], div[contenteditable="true"][aria-label*="comment"], div[role="textbox"][data-lexical-editor="true"]').first
+                            await comment_box.wait_for(state='visible', timeout=5000)
+                            await comment_box.click(timeout=3000)
+                            successful_method = "post page comment box"
+                            print(f"   ✅ תיבת תגובה נמצאה! (שיטה: {successful_method})")
+                        else:
+                            print("      ❌ אין URL לפוסט")
                     except Exception as e:
                         print(f"      ❌ נכשל: {str(e)[:80]}")
 
@@ -440,6 +503,51 @@ class FacebookScraper:
 
             return False
     
+    def build_post_id(self, group_name: str, post_text: str, post_url: Optional[str]) -> str:
+        """יצירת מזהה יציב לפוסט"""
+        if post_url:
+            return post_url
+
+        payload = f"{group_name}|{post_text}".encode("utf-8")
+        stable_hash = hashlib.sha256(payload).hexdigest()[:16]
+        return f"{group_name}_{stable_hash}"
+
+    async def extract_post_url(self, post_element) -> Optional[str]:
+        """חילוץ URL של פוסט מתוך האלמנט"""
+        try:
+            link_candidates = post_element.locator(
+                'a[href*="/posts/"], a[href*="/permalink/"], a[href*="story_fbid="]'
+            )
+            if await link_candidates.count() > 0:
+                href = await link_candidates.first.get_attribute("href")
+                if href:
+                    return href
+        except Exception:
+            pass
+        return None
+
+    async def extract_post_timestamp(self, post_element) -> Optional[str]:
+        """חילוץ זמן פרסום של הפוסט"""
+        try:
+            utime_el = post_element.locator('abbr[data-utime], span[data-utime]')
+            if await utime_el.count() > 0:
+                utime = await utime_el.first.get_attribute("data-utime")
+                if utime and utime.isdigit():
+                    return datetime.fromtimestamp(int(utime)).isoformat()
+        except Exception:
+            pass
+
+        try:
+            time_el = post_element.locator('time[datetime]')
+            if await time_el.count() > 0:
+                datetime_str = await time_el.first.get_attribute("datetime")
+                if datetime_str:
+                    return datetime_str
+        except Exception:
+            pass
+
+        return None
+
     async def human_delay(self, min_sec: float, max_sec: float):
         """עיכוב אקראי שנראה אנושי"""
         delay = random.uniform(min_sec, max_sec)

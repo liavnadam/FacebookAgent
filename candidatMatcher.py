@@ -20,47 +20,83 @@ class CandidateMatcher:
     def is_candidate_post(self, post_text: str) -> Tuple[bool, float, List[str]]:
         """
         בדיקה האם פוסט הוא של מועמד מחפש עבודה
-        
+
         Returns:
             tuple: (האם מועמד, ציון, מילות מפתח שנמצאו)
         """
         if not post_text:
             return False, 0.0, []
-        
-        post_text_lower = post_text.lower()
-        
+
+        # לא משנים ל-lower עבור עברית - בודקים את הטקסט המקורי
+        post_text_check = post_text.lower()  # לאנגלית
+
         # בדיקת מילות מפתח שליליות (מעסיק מחפש עובדים)
+        # בדיקה גם ב-lower וגם בטקסט המקורי (לעברית)
         for negative_keyword in self.negative_keywords:
-            if negative_keyword in post_text_lower:
+            if negative_keyword in post_text_check or negative_keyword in post_text:
                 return False, 0.0, []
-        
+
+        # סימנים נוספים של מודעת דרושים (לא מועמד)
+        job_posting_patterns = [
+            "📞",  # טלפון בפוסט = כנראה מודעה
+            "☎",
+            "משכורת",
+            "שכר גבוה",
+            "בונוסים",
+            "למשרה מלאה",
+            "למשרה חלקית",
+            "קו\"ח ל",
+            "שלחו ל",
+            "פנו ל",
+            "צרו קשר",
+            "נא לפנות",
+            "יש לשלוח",
+            "לשליחת",
+            "תנאים מעולים",
+            "תנאים טובים",
+            "ניתן לפנות",
+            "מספר טלפון",
+            "וואטסאפ",
+            "whatsapp",
+        ]
+        for pattern in job_posting_patterns:
+            if pattern in post_text or pattern.lower() in post_text_check:
+                return False, 0.0, []
+
         # בדיקת מילות מפתח חיוביות (מועמד מחפש עבודה)
         matched_keywords = []
         for positive_keyword in self.positive_keywords:
-            if positive_keyword in post_text_lower:
+            if positive_keyword in post_text_check or positive_keyword in post_text:
                 matched_keywords.append(positive_keyword)
-        
+
         # חישוב ציון
         if len(matched_keywords) == 0:
             return False, 0.0, []
-        
+
         # ציון מ-0 עד 10
-        score = min(len(matched_keywords) * 3.0, 10.0)
-        
+        score = min(len(matched_keywords) * 2.5, 10.0)
+
         # בונוס אם הפוסט קצר (סביר שזה מחפש עבודה ולא משהו אחר)
-        if len(post_text) < 200:
-            score += 1.0
-        
+        if len(post_text) < 300:
+            score += 1.5
+
         # בונוס אם יש התייחסות למיקום
         locations = ["פתח תקווה", "הוד השרון", "כפר סבא", "רעננה", "המרכז", "השרון"]
         for location in locations:
             if location in post_text:
                 score += 0.5
-        
+
+        # בונוס אם הפוסט בגוף ראשון (אני מחפש, אני צריך)
+        first_person_patterns = ["אני מחפש", "אני צריך", "אני רוצה", "אני מעוניין", "אני זמין"]
+        for pattern in first_person_patterns:
+            if pattern in post_text:
+                score += 2.0
+                break
+
         score = min(score, 10.0)  # מקסימום 10
-        
-        is_candidate = score >= 3.0  # סף של 3.0
-        
+
+        is_candidate = score >= 5.0  # סף גבוה יותר של 5.0
+
         return is_candidate, score, matched_keywords
     
     def match_to_job(self, post_text: str, _author_name: str = "") -> Optional[Dict]:
@@ -166,9 +202,10 @@ class CandidateMatcher:
             tuple: (האם לענות, סיבה)
         """
         # בדיקת גיל הפוסט
-        if 'posted_at' in post_data:
+        posted_at = post_data.get('posted_at')
+        if posted_at:
             try:
-                posted_date = datetime.fromisoformat(post_data['posted_at'])
+                posted_date = datetime.fromisoformat(posted_at)
                 max_age = timedelta(days=config.AUTOMATION_SETTINGS['max_post_age_days'])
                 
                 if datetime.now() - posted_date > max_age:
@@ -177,7 +214,7 @@ class CandidateMatcher:
                 pass  # אם יש שגיאה בפרסור התאריך, נמשיך
         
         # בדיקת ציון מועמד
-        if post_data.get('candidate_score', 0) < 3.0:
+        if post_data.get('candidate_score', 0) < 5.0:
             return False, "ציון מועמד נמוך מדי"
         
         # בדיקה אם יש התאמה למשרה

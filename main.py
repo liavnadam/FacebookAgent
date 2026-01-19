@@ -90,13 +90,28 @@ async def run_scheduler():
     
     # יצירת scheduler
     scheduler = AsyncIOScheduler()
+
+    active_days = config.AUTOMATION_SETTINGS.get('active_days', [])
+    day_names = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+    if active_days:
+        day_of_week = ",".join(day_names[day] for day in active_days if 0 <= day <= 6)
+    else:
+        day_of_week = "mon-sun"
+
+    start_hour = config.AUTOMATION_SETTINGS.get('active_hours_start', 0)
+    end_hour = config.AUTOMATION_SETTINGS.get('active_hours_end', 24)
+    if end_hour <= start_hour:
+        hour_expr = "0-23/2"
+    else:
+        last_hour = min(end_hour - 1, 23)
+        hour_expr = f"{start_hour}-{last_hour}/2"
     
     # תזמון - כל 2 שעות בימים פעילים
     scheduler.add_job(
         scheduled_scan,
         CronTrigger(
-            hour='9-20/2',  # כל 2 שעות בין 9 ל-20
-            day_of_week='sun-thu'  # א'-ה'
+            hour=hour_expr,  # כל 2 שעות בחלון הפעילות
+            day_of_week=day_of_week
         ),
         id='facebook_scan',
         max_instances=1,  # מונע חפיפה

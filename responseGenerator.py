@@ -51,7 +51,7 @@ class ResponseGenerator:
     def _format_name(self, name: str) -> str:
         """עיצוב השם בצורה יפה"""
         if not name:
-            return "שם"
+            return ""
         
         # אם השם מכיל רק שם פרטי
         parts = name.split()

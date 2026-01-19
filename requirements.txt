@@ -1,7 +1,18 @@
-# Core dependencies
-apscheduler>=3.10.4
-playwright>=1.40.0
-playwright-stealth>=1.0.0
+# תלויות פרויקט הבוט לגיוס AIG
 
-# Additional dependencies (add others as needed)
-python-dotenv>=1.0.0
+# אוטומציה של דפדפן
+playwright==1.47.0
+playwright-stealth==0.1.1
+
+# מסד נתונים
+# sqlite3 מובנה ב-Python
+
+# תזמון משימות
+APScheduler==3.10.4
+
+# עזרים כלליים
+python-dateutil==2.9.0
+python-dotenv==1.0.1
+
+# אופציונלי - לניתוח טקסט מתקדם (אם רוצים)
+# spacy==3.7.2
