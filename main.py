@@ -1,6 +1,7 @@
 """
 קובץ ראשי להפעלת בוט גיוס AIG
 מריץ סשני סריקה לפי לוח זמנים מוגדר
+Production Ready - עם מנגנון retry והתאוששות משגיאות
 """
 
 import asyncio
@@ -14,6 +15,44 @@ from apscheduler.triggers.cron import CronTrigger
 import config
 from facebookScraper import run_scan_session
 from database import get_db
+
+
+# הגדרות Retry
+MAX_RETRIES = 3
+RETRY_DELAY_SECONDS = 30
+
+
+async def run_with_retry(func, *args, **kwargs):
+    """
+    הרצת פונקציה עם מנגנון retry לשגיאות רשת
+
+    Args:
+        func: הפונקציה להרצה
+        *args, **kwargs: פרמטרים לפונקציה
+
+    Returns:
+        תוצאת הפונקציה או None אם כל הניסיונות נכשלו
+    """
+    last_error = None
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            return await func(*args, **kwargs)
+        except (ConnectionError, TimeoutError, OSError) as e:
+            last_error = e
+            if attempt < MAX_RETRIES:
+                print(f"⚠️ שגיאת רשת (ניסיון {attempt}/{MAX_RETRIES}): {str(e)[:50]}")
+                print(f"   ממתין {RETRY_DELAY_SECONDS} שניות לפני ניסיון נוסף...")
+                await asyncio.sleep(RETRY_DELAY_SECONDS)
+            else:
+                print(f"❌ כל {MAX_RETRIES} הניסיונות נכשלו")
+                raise last_error
+        except Exception as e:
+            # שגיאות אחרות - לא מנסים שוב
+            print(f"❌ שגיאה לא צפויה: {e}")
+            raise
+
+    return None
 
 
 def is_active_time() -> bool:
@@ -63,7 +102,7 @@ async def scheduled_scan():
     print("\n🚀 מתחיל סשן סריקה...\n")
     
     try:
-        await run_scan_session()
+        await run_with_retry(run_scan_session)
         print("\n✅ סשן סריקה הושלם בהצלחה\n")
     except Exception as e:
         print(f"\n❌ שגיאה בסשן סריקה: {e}\n")

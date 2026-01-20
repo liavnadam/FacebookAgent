@@ -1,13 +1,17 @@
 """
 סורק פייסבוק אוטומטי עם Playwright
 כולל טכניקות הסוואה למניעת זיהוי
+Production Ready - עם ניהול שגיאות, stealth, וניקוי אוטומטי
 """
 
 import asyncio
 import random
 import hashlib
+import os
+import re
 from datetime import datetime
 from typing import List, Dict, Optional
+from pathlib import Path
 
 from playwright.async_api import async_playwright, Page, Browser
 from playwright_stealth import Stealth
@@ -16,6 +20,77 @@ import config
 from database import get_db
 from candidatMatcher import get_matcher
 from responseGenerator import get_generator
+
+
+def cleanup_old_screenshots(screenshot_dir: Path, max_files: int = 50):
+    """
+    ניקוי צילומי מסך ישנים כדי למנוע בעיות נפח דיסק
+
+    Args:
+        screenshot_dir: תיקיית הצילומים
+        max_files: מספר קבצים מקסימלי לשמור
+    """
+    try:
+        if not screenshot_dir.exists():
+            return
+
+        # קבלת כל קבצי PNG בתיקייה
+        files = list(screenshot_dir.glob("*.png"))
+
+        if len(files) <= max_files:
+            return
+
+        # מיון לפי זמן שינוי (ישן ראשון)
+        files.sort(key=lambda x: x.stat().st_mtime)
+
+        # מחיקת הקבצים הישנים ביותר
+        files_to_delete = len(files) - max_files
+        for file in files[:files_to_delete]:
+            try:
+                file.unlink()
+            except Exception:
+                pass
+
+        print(f"   🧹 נמחקו {files_to_delete} צילומי מסך ישנים")
+
+    except Exception as e:
+        print(f"   ⚠️ שגיאה בניקוי צילומים: {e}")
+
+
+def clean_author_name(raw_name: str) -> str:
+    """
+    ניקוי שם מחבר מתווים מיותרים
+
+    Examples:
+        "Moshe > Jobs Petah Tikva" -> "Moshe"
+        "David Cohen\nFollow\n2 hours" -> "David Cohen"
+    """
+    if not raw_name:
+        return ""
+
+    # הסרת תווים מיוחדים וחיתוך לפני סימנים
+    name = raw_name.strip()
+
+    # חיתוך לפני ">"
+    if ">" in name:
+        name = name.split(">")[0].strip()
+
+    # חיתוך לפני שורה חדשה
+    if "\n" in name:
+        name = name.split("\n")[0].strip()
+
+    # חיתוך לפני "·" (נקודה אמצעית של פייסבוק)
+    if "·" in name:
+        name = name.split("·")[0].strip()
+
+    # הסרת רווחים כפולים
+    name = re.sub(r'\s+', ' ', name)
+
+    # אם השם ארוך מדי, כנראה שזה לא שם אמיתי
+    if len(name) > 50:
+        return ""
+
+    return name
 
 
 class FacebookScraper:
@@ -39,13 +114,18 @@ class FacebookScraper:
 
         print(f"💾 משתמש בסשן שמור: {user_data_dir}")
 
+        # בחירת User Agent אקראי לכל הפעלה (stealth)
+        user_agent = config.get_random_user_agent()
+        print(f"🕵️ User Agent: {user_agent[:50]}...")
+
         # פתיחת דפדפן עם persistent context (שומר cookies וסשן)
         context = await playwright.chromium.launch_persistent_context(
             user_data_dir=str(user_data_dir),
             headless=config.BROWSER_SETTINGS['headless'],
             slow_mo=config.BROWSER_SETTINGS['slow_mo'],
             viewport=config.BROWSER_SETTINGS['viewport'],
-            user_agent=config.BROWSER_SETTINGS['user_agent']
+            user_agent=user_agent,
+            args=["--start-maximized"]
         )
 
         self.browser = context.browser
@@ -189,13 +269,12 @@ class FacebookScraper:
                     try:
                         # נסיון מספר 1: חיפוש קישור עם התפקיד link
                         author_element = await post_element.locator('a[role="link"]').first.inner_text()
-                        author_name = author_element.strip()
+                        author_name = clean_author_name(author_element)
                     except:
                         try:
                             # נסיון מספר 2: השורה הראשונה בפוסט (לרוב השם)
                             first_line = post_text.split('\n')[0].strip()
-                            if len(first_line) < 50:  # אם זה קצר, כנראה שזה שם
-                                author_name = first_line
+                            author_name = clean_author_name(first_line)
                         except:
                             pass
                     
@@ -266,9 +345,9 @@ class FacebookScraper:
                     print(f"   ⏸️ הגענו למגבלה היומית ({max_daily} תגובות)")
                     break
                 
-                # בדיקה אם כבר הגבנו לפוסט זה
+                # בדיקה אם כבר הגבנו לפוסט זה (מיד לפני תגובה)
                 if self.db.has_responded_to_post(post['post_id']):
-                    print("   ⏭️ כבר הגבנו לפוסט זה")
+                    print("   ⏭️ Already responded")
                     continue
                 
                 # יצירת תגובה
@@ -302,6 +381,11 @@ class FacebookScraper:
     async def create_and_send_response(self, post: Dict, analysis: Dict) -> bool:
         """יצירה ושליחת תגובה"""
         try:
+            # בדיקה אחרונה לפני שליחה - למניעת תגובות כפולות
+            if self.db.has_responded_to_post(post['post_id']):
+                print("   ⏭️ Already responded")
+                return False
+
             # יצירת התגובה
             candidate_info = analysis.get('candidate_info', {})
             matched_job = analysis.get('matched_job')
@@ -328,6 +412,9 @@ class FacebookScraper:
                 screenshot_dir = config.DATA_DIR / "screenshots"
                 screenshot_dir.mkdir(exist_ok=True)
 
+                # ניקוי צילומי מסך ישנים (שומר עד 50)
+                cleanup_old_screenshots(screenshot_dir, max_files=50)
+
                 try:
                     screenshot_before = screenshot_dir / f"before_{timestamp}.png"
                     await post['element'].screenshot(path=str(screenshot_before))
@@ -348,33 +435,48 @@ class FacebookScraper:
 
                 print("   🔍 מחפש תיבת תגובה...")
 
-                # שיטה 0: לחץ על כפתור/אזור תגובה כדי לפתוח את תיבת התגובה
+                # שיטה 0: שימוש ב-Relative Locators - מצא Like ואז Comment ליד
                 try:
-                    print("      ניסיון 0: לחיצה על אזור תגובות")
-                    # נסה מספר אפשרויות לפתוח את תיבת התגובה
+                    print("      ניסיון 0: חיפוש כפתור תגובה ליד כפתור לייק (Relative Locator)")
+                    # מצא את אזור הכפתורים (Like, Comment, Share) וחפש את הלייק
+                    action_bar = post['element'].locator('div[role="button"]')
+                    buttons = await action_bar.all()
+
+                    for button in buttons:
+                        try:
+                            button_text = await button.inner_text()
+                            # אם זה כפתור לייק, הכפתור הבא הוא כנראה תגובה
+                            if any(word in button_text.lower() for word in ['like', 'לייק', 'אהבתי']):
+                                comment_button = button.locator('xpath=following-sibling::div[@role="button"][1]')
+                                if await comment_button.count() > 0:
+                                    await comment_button.first.click(timeout=2000)
+                                    print("      ✅ נלחץ על כפתור תגובה (אחרי לייק)")
+                                    await self.human_delay(1, 1.5)
+                                    break
+                        except:
+                            continue
+                except Exception as e:
+                    print(f"      ⚠️ שיטת Relative Locator נכשלה: {str(e)[:40]}")
+
+                # שיטה 0b: נסה למצוא אזור תגובות ישירות
+                try:
                     comment_area_selectors = [
                         'div[aria-label*="תגובה"]',
                         'div[aria-label*="Comment"]',
-                        'span:has-text("תגובה")',
+                        'span:has-text("תגובה"):not(:has-text("תגובות"))',
                         'div[aria-label*="Write"]',
                         'div[aria-label*="כתוב"]',
-                        'form[role="presentation"]',  # Facebook comment form
-                        'div[data-visualcompletion="ignore-dynamic"]'  # Comment section container
                     ]
-                    clicked = False
                     for selector in comment_area_selectors:
                         try:
                             element = post['element'].locator(selector).first
                             if await element.count() > 0:
                                 await element.click(timeout=2000)
-                                clicked = True
                                 print(f"      ✅ נלחץ על: {selector[:30]}")
                                 await self.human_delay(1, 1.5)
                                 break
                         except:
                             continue
-                    if not clicked:
-                        print("      ⚠️ לא נמצא אזור תגובות בפוסט")
                 except Exception as e:
                     print(f"      ⚠️ שגיאה בלחיצה: {str(e)[:50]}")
 
@@ -460,9 +562,39 @@ class FacebookScraper:
                 await self.human_type(comment_box, response_text)
                 await self.human_delay(1, 1.5)
 
-                # לחיצה על Enter לשליחה
+                # שליחת התגובה - כפתור שליחה (לא Enter)
                 print("   📤 שולח תגובה...")
-                await comment_box.press('Enter')
+                send_success = False
+
+                # נסה למצוא כפתור שליחה (אייקון חץ/מטוס נייר)
+                try:
+                    send_button_selectors = [
+                        'div[aria-label*="שלח"]',
+                        'div[aria-label*="Send"]',
+                        'button[aria-label*="Send"]',
+                        'button[type="submit"]',
+                        'div[aria-label*="submit"]',
+                        'div[aria-label*="Post"]',
+                        'div[aria-label*="פרסם"]',
+                        'div[role="button"][tabindex="0"]:near(div[contenteditable="true"])',
+                    ]
+                    for selector in send_button_selectors:
+                        try:
+                            send_btn = self.page.locator(selector).first
+                            if await send_btn.count() > 0:
+                                await send_btn.click(timeout=3000)
+                                send_success = True
+                                print("      ✅ נלחץ על כפתור שליחה")
+                                break
+                        except:
+                            continue
+                except Exception as e:
+                    print(f"      ⚠️ לא נמצא כפתור שליחה: {str(e)[:30]}")
+
+                if not send_success:
+                    print("      ❌ לא נמצא כפתור שליחה, מדלג על תגובה")
+                    return False
+
                 await self.human_delay(3, 4)
 
                 # צילום מסך אחרי שליחה
@@ -506,7 +638,7 @@ class FacebookScraper:
     def build_post_id(self, group_name: str, post_text: str, post_url: Optional[str]) -> str:
         """יצירת מזהה יציב לפוסט"""
         if post_url:
-            return post_url
+            return post_url.split("?", 1)[0]
 
         payload = f"{group_name}|{post_text}".encode("utf-8")
         stable_hash = hashlib.sha256(payload).hexdigest()[:16]

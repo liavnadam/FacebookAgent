@@ -339,31 +339,35 @@ OPEN_POSITIONS = {
 # תבניות תגובות (עם וריאציות)
 # ======================================
 RESPONSE_TEMPLATES = [
-    # תבנית 1 - קצרה וישירה
+    # תבנית 1 - ישיר עם CTA חזק (זכר יחיד)
     """היי{name}, ראיתי שאתה מחפש עבודה.
-יש לנו משרה של {job_title} באזור {location}.
-אם מעניין שלח לי הודעה ואספר יותר""",
+אני מגייס עכשיו ל-AIG לתפקיד {job_title} עם תנאים טובים.
+שלחתי לך את כל הפרטים בפרטי, דבר איתי :)""",
 
-    # תבנית 2 - יותר אישית
-    """שלום{name}, נתקלתי בפוסט שלך.
-יש לנו תפקיד פתוח של {job_title} ב{location}.
-אם רלוונטי תכתוב לי בפרטי""",
+    # תבנית 2 - יוצר engagement (זכר יחיד)
+    """שלום{name}!
+נתקלתי בפוסט שלך, ואני מגייס ל-AIG לתפקיד {job_title} באזור {location}.
+תגיב "אני" ואשלח לך פרטים מלאים בפרטי 👇""",
 
-    # תבנית 3 - מזדמן
-    """היי, מחפש משהו בתחום {job_title}?
-יש לנו משרה באזור {location}.
-תשלח הודעה אם מעניין""",
+    # תבנית 3 - מזדמן עם דחיפות קלה (זכר יחיד)
+    """היי{name}, ראיתי את הפוסט שלך.
+אני מגייס ל-AIG לתפקיד {job_title} והתחלה אפשרית בקרוב.
+רוצה לשמוע? כתוב לי""",
 
-    # תבנית 4 - קצר מאוד
-    """שלום{name},
-יש משרה פתוחה ב{job_title} באזור {location}.
-הדרישה העיקרית: {requirements}.
-מעניין? כתוב לי בפרטי""",
+    # תבנית 4 - ערך מוסף + engagement (זכר יחיד)
+    """מחפש עבודה באזור {location}?
+אני מגייס ל-AIG לתפקיד {job_title} עם תנאים מצוינים.
+תגיב "מעוניין" ואחזור אליך עם כל הפרטים!""",
 
-    # תבנית 5 - יותר חמה
-    """היי, אני מגייס ל-AIG.
-יש לי משרה של {job_title} ב{location} שאולי תתאים לך.
-אם רוצה לשמוע עוד פרטים תכתוב לי"""
+    # תבנית 5 - אישי וחם (זכר יחיד)
+    """היי{name}, נתקלתי בפוסט שלך.
+אני מגייס ל-AIG לתפקיד {job_title} שיכול להתאים לך.
+שלחתי לך הודעה פרטית עם הפרטים :)""",
+
+    # תבנית 6 - קצר ולעניין (זכר יחיד)
+    """היי{name}!
+ראיתי שאתה מחפש, ואני מגייס ל-AIG לתפקיד {job_title} ב{location}.
+מעוניין? תגיב פה ואשלח פרטים 👍""",
 ]
 
 # ======================================
@@ -395,11 +399,38 @@ AUTOMATION_SETTINGS = {
 # ======================================
 # הגדרות Playwright לניווט
 # ======================================
+
+# רשימת User Agents מודרניים לרוטציה (stealth)
+USER_AGENTS = [
+    # Chrome Windows
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+    # Chrome macOS
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+    # Firefox Windows
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0",
+    # Edge
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0",
+    # Safari macOS
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15",
+]
+
+
+def get_random_user_agent() -> str:
+    """בחירת User Agent אקראי לכל הפעלה (stealth)"""
+    import random
+    return random.choice(USER_AGENTS)
+
+
 BROWSER_SETTINGS = {
     "headless": False,  # להתחלה נראה את הדפדפן (לבדיקה)
     "slow_mo": 100,     # האטה של 100ms בין פעולות (מהיר יותר)
-    "viewport": {"width": 1280, "height": 720},
-    "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    "viewport": None,  # חלון מלא ללא חיתוך תצוגה
+    "user_agent": get_random_user_agent()  # ייבחר אקראית בכל הפעלה
 }
 
 # ======================================

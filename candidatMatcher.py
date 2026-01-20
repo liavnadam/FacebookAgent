@@ -1,12 +1,114 @@
 """
 מנוע התאמת מועמדים למשרות
 מזהה מועמדים פוטנציאליים ומתאים אותם למשרות פתוחות
+Production Ready - עם לוגיקה חכמה וזיהוי הקשר
 """
 
 import re
 from typing import Dict, List, Tuple, Optional
 from datetime import datetime, timedelta
 import config
+
+
+def analyze_with_llm(post_text: str) -> Optional[Dict]:
+    """
+    ניתוח פוסט באמצעות LLM לדיוק מקסימלי
+
+    Args:
+        post_text: טקסט הפוסט לניתוח
+
+    Returns:
+        dict עם תוצאות הניתוח או None אם לא זמין
+
+    TODO: להוסיף קריאת API ל-OpenAI/Gemini בעתיד
+    כדי לקבל ניתוח מדויק יותר של:
+    - האם זה מועמד או מעסיק
+    - איזה סוג עבודה מחפשים
+    - רמת ניסיון
+    - מיקום מועדף
+
+    Example implementation:
+        import openai
+        response = openai.ChatCompletion.create(
+            model="gpt-4",
+            messages=[{
+                "role": "system",
+                "content": "Analyze if this Facebook post is from a job seeker..."
+            }, {
+                "role": "user",
+                "content": post_text
+            }]
+        )
+        return parse_llm_response(response)
+    """
+    # Placeholder - יוחלף בקריאת API אמיתית בעתיד
+    return None
+
+
+def analyze_text_semantic(text: str, api_key: str = None) -> Optional[Dict]:
+    """
+    Semantic text analysis using OpenAI API for recruitment trend analysis.
+
+    Args:
+        text: The text to analyze
+        api_key: OpenAI API key (optional, can use env var)
+
+    Returns:
+        dict with analysis results:
+            - text_quality: float (0-1)
+            - category: str (e.g., 'job_seeker', 'employer', 'other')
+            - confidence: float (0-1)
+            - keywords: List[str]
+        Returns None if API is not configured.
+
+    TODO: Implement actual OpenAI API call
+    Example:
+        from openai import OpenAI
+        client = OpenAI(api_key=api_key or os.getenv("OPENAI_API_KEY"))
+        response = client.chat.completions.create(
+            model="gpt-4",
+            messages=[
+                {"role": "system", "content": "Analyze text quality and classify..."},
+                {"role": "user", "content": text}
+            ],
+            response_format={"type": "json_object"}
+        )
+        return json.loads(response.choices[0].message.content)
+    """
+    # Placeholder - to be implemented with actual API integration
+    return None
+
+
+def is_employer_context(text: str, keyword: str) -> bool:
+    """
+    בדיקה אם מילת מפתח מופיעה בהקשר של מעסיק
+
+    Examples:
+        "אנחנו משלמים משכורת גבוהה" -> True (מעסיק)
+        "אני מחפש משכורת גבוהה" -> False (מועמד)
+    """
+    # הקשרים שמעידים על מעסיק
+    employer_prefixes = [
+        "אנחנו מציעים", "אנו מציעים", "החברה מציעה",
+        "נותנים", "מציעים", "כולל", "עם אפשרות",
+        "המשרה כוללת", "התפקיד כולל",
+        "אנחנו משלמים", "משלמים", "שכר של",
+    ]
+
+    text_lower = text.lower()
+    keyword_pos = text_lower.find(keyword.lower())
+
+    if keyword_pos == -1:
+        return False
+
+    # בדוק 50 תווים לפני המילה
+    context_before = text_lower[max(0, keyword_pos - 50):keyword_pos]
+
+    for prefix in employer_prefixes:
+        if prefix in context_before:
+            return True
+
+    return False
 
 
 class CandidateMatcher:
@@ -27,24 +129,40 @@ class CandidateMatcher:
         if not post_text:
             return False, 0.0, []
 
+        # נסה לנתח עם LLM אם זמין (לדיוק מקסימלי)
+        llm_result = analyze_with_llm(post_text)
+        if llm_result is not None:
+            return (
+                llm_result.get('is_candidate', False),
+                llm_result.get('score', 0.0),
+                llm_result.get('keywords', [])
+            )
+
         # לא משנים ל-lower עבור עברית - בודקים את הטקסט המקורי
         post_text_check = post_text.lower()  # לאנגלית
 
         # בדיקת מילות מפתח שליליות (מעסיק מחפש עובדים)
-        # בדיקה גם ב-lower וגם בטקסט המקורי (לעברית)
+        # חכם יותר: בודק הקשר ולא רק קיום המילה
         for negative_keyword in self.negative_keywords:
             if negative_keyword in post_text_check or negative_keyword in post_text:
-                return False, 0.0, []
+                # מילים שתמיד פוסלות (לא תלויות הקשר)
+                always_disqualify = [
+                    "דרושים", "דרוש/ה", "דרושה", "מגייסים", "מגייסת",
+                    "חברתנו מחפשת", "החברה מחפשת", "אנחנו מחפשים",
+                    "hiring", "we are looking for", "recruiting"
+                ]
+                if any(word in post_text_check or word in post_text for word in always_disqualify):
+                    return False, 0.0, []
 
-        # סימנים נוספים של מודעת דרושים (לא מועמד)
-        job_posting_patterns = [
+        # סימנים של מודעת דרושים שתלויים בהקשר
+        context_dependent_patterns = [
+            "משכורת", "שכר גבוה", "בונוסים", "תנאים מעולים", "תנאים טובים"
+        ]
+
+        # סימנים שתמיד מעידים על מעסיק (לא תלויים בהקשר)
+        employer_only_patterns = [
             "📞",  # טלפון בפוסט = כנראה מודעה
             "☎",
-            "משכורת",
-            "שכר גבוה",
-            "בונוסים",
-            "למשרה מלאה",
-            "למשרה חלקית",
             "קו\"ח ל",
             "שלחו ל",
             "פנו ל",
@@ -52,16 +170,23 @@ class CandidateMatcher:
             "נא לפנות",
             "יש לשלוח",
             "לשליחת",
-            "תנאים מעולים",
-            "תנאים טובים",
             "ניתן לפנות",
             "מספר טלפון",
-            "וואטסאפ",
-            "whatsapp",
+            "להגיש מועמדות",
+            "לשלוח קורות חיים ל",
         ]
-        for pattern in job_posting_patterns:
+
+        for pattern in employer_only_patterns:
             if pattern in post_text or pattern.lower() in post_text_check:
                 return False, 0.0, []
+
+        # בדיקת דפוסים תלויי הקשר
+        for pattern in context_dependent_patterns:
+            if pattern in post_text or pattern.lower() in post_text_check:
+                # אם זה בהקשר של מעסיק - פסול
+                if is_employer_context(post_text, pattern):
+                    return False, 0.0, []
+                # אם זה בהקשר של מועמד (מחפש משכורת גבוהה) - זה בסדר
 
         # בדיקת מילות מפתח חיוביות (מועמד מחפש עבודה)
         matched_keywords = []
