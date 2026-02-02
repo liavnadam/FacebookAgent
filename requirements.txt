@@ -2,7 +2,7 @@
 
 # אוטומציה של דפדפן
 playwright==1.47.0
-playwright-stealth==0.1.1
+playwright-stealth>=1.0.6
 
 # מסד נתונים
 # sqlite3 מובנה ב-Python

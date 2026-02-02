@@ -100,13 +100,20 @@ class FacebookScraper:
         self.db = get_db()
         self.matcher = get_matcher()
         self.generator = get_generator()
+        self.playwright = None
+        self.context = None
         self.browser: Optional[Browser] = None
         self.page: Optional[Page] = None
         self.is_logged_in = False
     
     async def start(self):
         """הפעלת הדפדפן והתחברות"""
-        playwright = await async_playwright().start()
+        # Store playwright instance on self so it is not garbage-collected
+        # while the browser session is alive.  Losing this reference causes
+        # the underlying browser process to be torn down, which is the root
+        # cause of "Target page, context or browser has been closed" errors
+        # when scanning the second group onwards.
+        self.playwright = await async_playwright().start()
 
         # נתיב לשמירת הסשן
         user_data_dir = config.DATA_DIR / "browser_session"
@@ -119,7 +126,10 @@ class FacebookScraper:
         print(f"🕵️ User Agent: {user_agent[:50]}...")
 
         # פתיחת דפדפן עם persistent context (שומר cookies וסשן)
-        context = await playwright.chromium.launch_persistent_context(
+        # launch_persistent_context returns a BrowserContext directly
+        # (not a Browser).  context.browser is None for persistent contexts,
+        # so we must store the context itself to keep it alive.
+        self.context = await self.playwright.chromium.launch_persistent_context(
             user_data_dir=str(user_data_dir),
             headless=config.BROWSER_SETTINGS['headless'],
             slow_mo=config.BROWSER_SETTINGS['slow_mo'],
@@ -128,8 +138,8 @@ class FacebookScraper:
             args=["--start-maximized"]
         )
 
-        self.browser = context.browser
-        self.page = context.pages[0] if context.pages else await context.new_page()
+        self.browser = self.context.browser
+        self.page = self.context.pages[0] if self.context.pages else await self.context.new_page()
 
         # החלת טכניקות הסוואה
         stealth = Stealth()
@@ -137,55 +147,119 @@ class FacebookScraper:
 
         print("✅ דפדפן הופעל בהצלחה")
     
+    async def _is_logged_in_check(self) -> bool:
+        """בדיקה אמיתית אם מחוברים לפייסבוק - לא רק לפי URL"""
+        try:
+            # חיפוש אלמנטים שמופיעים רק כשמחוברים
+            logged_in_selectors = [
+                'div[role="navigation"]',           # סרגל ניווט עליון
+                'a[aria-label="Profile"]',           # קישור לפרופיל
+                'a[aria-label="פרופיל"]',
+                'svg[aria-label="Your profile"]',
+                'div[aria-label="Facebook"]',        # לוגו מחובר
+                'input[aria-label="Search Facebook"]',
+                'input[aria-label="חיפוש בפייסבוק"]',
+            ]
+            for sel in logged_in_selectors:
+                if await self.page.locator(sel).count() > 0:
+                    return True
+
+            # בדיקה שלילית: אם יש טופס login בעמוד
+            login_form = await self.page.locator('input[name="email"], input[name="pass"], #loginbutton, button:has-text("Log in"), button:has-text("Log In")').count()
+            if login_form > 0:
+                return False
+
+            # אם אין סימנים ברורים, נבדוק URL
+            url = self.page.url
+            if 'login' in url.lower() or 'checkpoint' in url.lower():
+                return False
+
+            return True
+        except:
+            return False
+
     async def login_to_facebook(self):
         """התחברות לפייסבוק"""
         try:
             print("🔐 בודק התחברות לפייסבוק...")
 
-            # מעבר לפייסבוק (domcontentloaded מהיר יותר מ-networkidle)
+            # מעבר לפייסבוק
             await self.page.goto('https://www.facebook.com/', wait_until='domcontentloaded', timeout=60000)
             await self.human_delay(3, 5)
 
-            # בדיקה אם כבר מחוברים - חיפוש סימנים שונים
+            # בדיקה אם כבר מחוברים
             print("🔍 בודק אם כבר מחובר...")
-
-            # אם אנחנו בדף הבית של פייסבוק (לא בדף login), כנראה שמחוברים
-            current_url = self.page.url
-            if 'login' not in current_url.lower() and 'facebook.com' in current_url:
+            if await self._is_logged_in_check():
                 print("✅ כבר מחובר לפייסבוק!")
                 self.is_logged_in = True
                 return True
-            
-            # אם לא מחוברים - מציע התחברות ידנית
-            print("\n" + "="*60)
-            print("⚠️  לא מחובר לפייסבוק!")
-            print("="*60)
-            print("\n📝 אפשרויות:")
-            print("   1. התחבר ידנית בחלון הדפדפן שנפתח")
-            print("   2. המתן 60 שניות לביצוע התחברות")
-            print("   3. הבוט ימשיך אוטומטית לאחר ההתחברות\n")
-            print("⏳ ממתין להתחברות ידנית...")
-            print("   (יש לך 60 שניות להתחבר)\n")
 
-            # ממתין עד 60 שניות שהמשתמש יתחבר ידנית
+            # לא מחוברים - ננסה להתחבר עם הפרטים מ-.env
+            email = config.FACEBOOK_CREDENTIALS.get('email', '')
+            password = config.FACEBOOK_CREDENTIALS.get('password', '')
+
+            if email and password:
+                print("🔑 מתחבר עם פרטי חשבון מ-.env...")
+                try:
+                    # מילוי שדה אימייל
+                    email_field = self.page.locator('input[name="email"], #email')
+                    await email_field.first.click(timeout=5000)
+                    await email_field.first.fill('')
+                    await self.human_type(email_field.first, email)
+                    await self.human_delay(0.5, 1)
+
+                    # מילוי שדה סיסמה
+                    pass_field = self.page.locator('input[name="pass"], #pass')
+                    await pass_field.first.click(timeout=5000)
+                    await pass_field.first.fill('')
+                    await self.human_type(pass_field.first, password)
+                    await self.human_delay(0.5, 1)
+
+                    # לחיצה על כפתור התחברות
+                    login_btn = self.page.locator('button[name="login"], #loginbutton, button[type="submit"]')
+                    await login_btn.first.click(timeout=5000)
+
+                    # המתנה לטעינת העמוד אחרי התחברות
+                    print("⏳ ממתין להתחברות...")
+                    await self.human_delay(5, 8)
+
+                    # בדיקה אם ההתחברות הצליחה
+                    if await self._is_logged_in_check():
+                        print("✅ התחברות הצליחה!")
+                        self.is_logged_in = True
+                        return True
+
+                    # אולי יש אימות דו-שלבי או checkpoint
+                    current_url = self.page.url
+                    if 'checkpoint' in current_url.lower() or 'two_step' in current_url.lower():
+                        print("\n⚠️ נדרש אימות דו-שלבי!")
+                        print("   אנא השלם את האימות בחלון הדפדפן...")
+                    else:
+                        print("⚠️ ההתחברות האוטומטית נכשלה")
+
+                except Exception as e:
+                    print(f"⚠️ שגיאה בהתחברות אוטומטית: {str(e)[:60]}")
+
+            # fallback - המתנה להתחברות ידנית
+            print("\n" + "="*60)
+            print("⚠️  אנא התחבר ידנית בחלון הדפדפן")
+            print("="*60)
+            print("⏳ ממתין להתחברות... (60 שניות)\n")
+
             for i in range(60):
                 await asyncio.sleep(1)
-                current_url = self.page.url
-
-                # בדיקה אם המשתמש התחבר
-                if 'login' not in current_url.lower():
+                if await self._is_logged_in_check():
                     print(f"\n✅ התחברות הצליחה! (אחרי {i+1} שניות)")
                     self.is_logged_in = True
                     await self.human_delay(2, 3)
                     return True
 
-                # הדפסת נקודות התקדמות
                 if (i + 1) % 10 == 0:
                     print(f"   ... עדיין ממתין ({60-i-1} שניות נותרו)")
 
             print("\n❌ פג זמן ההתחברות - נסה שוב")
             return False
-                
+
         except Exception as e:
             print(f"❌ שגיאה בהתחברות: {e}")
             self.db.log_error("login_error", str(e), "התחברות לפייסבוק")
@@ -208,9 +282,15 @@ class FacebookScraper:
         print(f"\n🔍 סורק קבוצה: {group_name}")
         
         try:
-            # מעבר לקבוצה (domcontentloaded מהיר ויציב יותר)
+            # מעבר לקבוצה
             await self.page.goto(group_url, wait_until='domcontentloaded', timeout=60000)
-            await self.human_delay(2, 3)  # זמן קצר לטעינת הפוסטים
+            await self.human_delay(2, 3)
+
+            # בדיקה שלא הועברנו לדף login
+            current_url = self.page.url
+            if 'login' in current_url.lower() or 'checkpoint' in current_url.lower():
+                print(f"❌ הועברנו לדף התחברות - הסשן פג תוקף")
+                return []
             
             # גלילה למטה כמה פעמים לטעינת פוסטים
             posts_to_scan = config.AUTOMATION_SETTINGS['posts_to_scan_per_group']
@@ -220,6 +300,15 @@ class FacebookScraper:
                 await self.human_delay(1, 2)
                 print(f"   טעון פוסטים... ({i+1}/5 גלילות)")
             
+            # צילום מסך דיבוג לפני חילוץ
+            try:
+                debug_dir = config.DATA_DIR / "screenshots"
+                debug_dir.mkdir(exist_ok=True)
+                debug_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                await self.page.screenshot(path=str(debug_dir / f"debug_group_{debug_ts}.png"))
+            except:
+                pass
+
             # חילוץ פוסטים
             posts = await self.extract_posts_from_page(group_name, posts_to_scan)
             
@@ -242,9 +331,22 @@ class FacebookScraper:
         
         try:
             # מציאת כל הפוסטים בעמוד
-            # שים לב: הסלקטורים של פייסבוק משתנים - אלו הם גנריים
             post_elements = await self.page.locator('[role="article"]').all()
-            
+            print(f"   🔎 נמצאו {len(post_elements)} אלמנטי article בעמוד")
+
+            # אם אין article, ננסה סלקטורים חלופיים
+            if len(post_elements) == 0:
+                alt_selectors = [
+                    'div[data-ad-comet-preview="message"]',
+                    'div.x1yztbdb',
+                    'div[role="feed"] > div',
+                ]
+                for sel in alt_selectors:
+                    post_elements = await self.page.locator(sel).all()
+                    if len(post_elements) > 0:
+                        print(f"   🔎 נמצאו {len(post_elements)} פוסטים עם סלקטור: {sel[:40]}")
+                        break
+
             for i, post_element in enumerate(post_elements[:max_posts]):
                 try:
                     # חילוץ טקסט הפוסט
@@ -429,114 +531,129 @@ class FacebookScraper:
                 except:
                     pass
 
-                # אסטרטגיה חדשה: חיפוש של כל תיבות טקסט עריכה בפוסט
+                # חיפוש תיבת תגובה
                 comment_box = None
                 successful_method = None
 
                 print("   🔍 מחפש תיבת תגובה...")
 
-                # שיטה 0: שימוש ב-Relative Locators - מצא Like ואז Comment ליד
-                try:
-                    print("      ניסיון 0: חיפוש כפתור תגובה ליד כפתור לייק (Relative Locator)")
-                    # מצא את אזור הכפתורים (Like, Comment, Share) וחפש את הלייק
-                    action_bar = post['element'].locator('div[role="button"]')
-                    buttons = await action_bar.all()
+                # כל וריאציות אפשריות של כפתור תגובה בעברית ואנגלית
+                comment_btn_selector = (
+                    'div[role="button"]:has(span:text("תגובה")), '
+                    'div[role="button"]:has(span:text("השב")), '
+                    'div[role="button"]:has(span:text("Comment")), '
+                    'div[role="button"]:has(span:text("Reply")), '
+                    'div[aria-label*="תגובה"], '
+                    'div[aria-label*="Comment"], '
+                    'div[aria-label*="Leave a comment"], '
+                    'div[aria-label*="השב"]'
+                )
 
-                    for button in buttons:
-                        try:
-                            button_text = await button.inner_text()
-                            # אם זה כפתור לייק, הכפתור הבא הוא כנראה תגובה
-                            if any(word in button_text.lower() for word in ['like', 'לייק', 'אהבתי']):
-                                comment_button = button.locator('xpath=following-sibling::div[@role="button"][1]')
-                                if await comment_button.count() > 0:
-                                    await comment_button.first.click(timeout=2000)
-                                    print("      ✅ נלחץ על כפתור תגובה (אחרי לייק)")
-                                    await self.human_delay(1, 1.5)
-                                    break
-                        except:
-                            continue
-                except Exception as e:
-                    print(f"      ⚠️ שיטת Relative Locator נכשלה: {str(e)[:40]}")
-
-                # שיטה 0b: נסה למצוא אזור תגובות ישירות
+                # שיטה 1: לחיצה על אזור ה-placeholder "כתיבת תגובה ציבורית..."
+                # ואז חיפוש תיבת הטקסט שנפתחה
                 try:
-                    comment_area_selectors = [
-                        'div[aria-label*="תגובה"]',
-                        'div[aria-label*="Comment"]',
-                        'span:has-text("תגובה"):not(:has-text("תגובות"))',
-                        'div[aria-label*="Write"]',
-                        'div[aria-label*="כתוב"]',
+                    print("      ניסיון 1: לחיצה על placeholder תגובה")
+                    await post['element'].scroll_into_view_if_needed(timeout=3000)
+                    await self.human_delay(0.5, 1)
+
+                    # חיפוש placeholder של תגובה - הטקסט "כתיבת תגובה ציבורית..."
+                    placeholder_selectors = [
+                        'div[aria-label*="כתיבת תגובה"], div[aria-label*="Write a comment"]',
+                        'div[role="textbox"], span[data-lexical-text="true"]',
+                        ':text("כתיבת תגובה")',
                     ]
-                    for selector in comment_area_selectors:
+                    clicked_placeholder = False
+                    for sel in placeholder_selectors:
                         try:
-                            element = post['element'].locator(selector).first
-                            if await element.count() > 0:
-                                await element.click(timeout=2000)
-                                print(f"      ✅ נלחץ על: {selector[:30]}")
-                                await self.human_delay(1, 1.5)
+                            ph = post['element'].locator(sel).first
+                            if await ph.count() > 0:
+                                await ph.click(timeout=3000)
+                                clicked_placeholder = True
+                                print(f"      ✅ נלחץ placeholder ({sel[:30]})")
+                                await self.human_delay(1, 2)
                                 break
                         except:
                             continue
-                except Exception as e:
-                    print(f"      ⚠️ שגיאה בלחיצה: {str(e)[:50]}")
 
-                # שיטה 1: חפש תיבת טקסט עריכה בתוך הפוסט (contenteditable)
-                try:
-                    print(f"      ניסיון 1: חיפוש div[contenteditable=true] בפוסט")
-                    editables_list = await post['element'].locator('div[contenteditable="true"]').all()
+                    if not clicked_placeholder:
+                        # fallback: לחיצה על כפתור "תגובה"/"השב"
+                        comment_btn = post['element'].locator(comment_btn_selector).first
+                        if await comment_btn.count() > 0:
+                            await comment_btn.click(timeout=3000)
+                            clicked_placeholder = True
+                            print("      ✅ נלחץ כפתור תגובה")
+                            await self.human_delay(1, 2)
 
-                    if len(editables_list) > 0:
-                        print(f"      נמצאו {len(editables_list)} אלמנטים עריכים")
-                        comment_box = editables_list[0]
-                        await comment_box.scroll_into_view_if_needed(timeout=2000)
-                        await comment_box.click(timeout=3000)
-                        successful_method = f"contenteditable (1/{len(editables_list)})"
-                        print(f"   ✅ תיבת תגובה נמצאה! (שיטה: {successful_method})")
+                    if clicked_placeholder:
+                        # חיפוש תיבת טקסט פעילה - בעמוד כולו
+                        textbox = self.page.locator(
+                            'div[role="textbox"][contenteditable="true"], '
+                            'div[contenteditable="true"][data-lexical-editor="true"], '
+                            'div[contenteditable="true"][aria-label*="תגובה"], '
+                            'div[contenteditable="true"][aria-label*="comment" i]'
+                        ).first
+                        try:
+                            await textbox.wait_for(state='visible', timeout=5000)
+                            await textbox.click(timeout=3000)
+                            comment_box = textbox
+                            successful_method = "placeholder click + page textbox"
+                            print(f"   ✅ תיבת תגובה נמצאה! (שיטה: {successful_method})")
+                        except:
+                            # נסה contenteditable כללי
+                            textbox = self.page.locator('div[contenteditable="true"]').last
+                            if await textbox.count() > 0:
+                                await textbox.click(timeout=3000)
+                                comment_box = textbox
+                                successful_method = "placeholder + last editable"
+                                print(f"   ✅ תיבת תגובה נמצאה! (שיטה: {successful_method})")
+                            else:
+                                print("      ⚠️ נלחץ אבל תיבת טקסט לא נמצאה")
                     else:
-                        print("      ❌ לא נמצאו אלמנטים עריכים בפוסט")
+                        print("      ❌ לא נמצא placeholder או כפתור תגובה")
                 except Exception as e:
                     print(f"      ❌ נכשל: {str(e)[:80]}")
 
-                # שיטה 2: חפש תיבת תגובה בכל העמוד (אחרי לחיצה על כפתור תגובה)
+                # שיטה 2: חיפוש תיבת טקסט קיימת בעמוד כולו
                 if not successful_method:
                     try:
-                        print(f"      ניסיון 2: חיפוש תיבת תגובה פעילה בעמוד")
-                        # חפש תיבת טקסט עם placeholder של תגובה
-                        comment_box = self.page.locator('div[contenteditable="true"][aria-placeholder*="תגובה"], div[contenteditable="true"][aria-placeholder*="comment"], div[role="textbox"][aria-label*="תגובה"], div[role="textbox"][aria-label*="comment"]').first
-                        await comment_box.wait_for(state='visible', timeout=3000)
-                        await comment_box.click(timeout=3000)
-                        successful_method = "page-wide comment box"
-                        print(f"   ✅ תיבת תגובה נמצאה! (שיטה: {successful_method})")
+                        print("      ניסיון 2: חיפוש תיבת טקסט פעילה בעמוד")
+                        textbox = self.page.locator('div[contenteditable="true"]').last
+                        if await textbox.count() > 0:
+                            await textbox.scroll_into_view_if_needed(timeout=2000)
+                            await textbox.click(timeout=3000)
+                            comment_box = textbox
+                            successful_method = "page-wide editable"
+                            print(f"   ✅ תיבת תגובה נמצאה! (שיטה: {successful_method})")
+                        else:
+                            print("      ❌ לא נמצאה תיבת טקסט בעמוד")
                     except Exception as e:
                         print(f"      ❌ נכשל: {str(e)[:80]}")
 
-                # שיטה 3: חפש לפי role="textbox" בפוסט
+                # שיטה 3: ניווט לעמוד הפוסט וחיפוש שם
                 if not successful_method:
                     try:
-                        print(f"      ניסיון 3: חיפוש div[role=textbox] בפוסט")
-                        comment_box = post['element'].locator('div[role="textbox"]').first
-                        await comment_box.scroll_into_view_if_needed(timeout=2000)
-                        await comment_box.wait_for(state='visible', timeout=2000)
-                        await comment_box.click(timeout=3000)
-                        successful_method = "role=textbox"
-                        print(f"   ✅ תיבת תגובה נמצאה! (שיטה: {successful_method})")
-                    except Exception as e:
-                        print(f"      ❌ נכשל: {str(e)[:80]}")
-
-                # שיטה 4: נווט לעמוד הפוסט ותגיב שם
-                if not successful_method:
-                    try:
-                        print(f"      ניסיון 4: ניווט לעמוד הפוסט")
                         post_url = post.get('post_url')
                         if post_url and 'facebook.com' in post_url:
+                            print(f"      ניסיון 3: ניווט לעמוד הפוסט")
                             await self.page.goto(post_url, wait_until='domcontentloaded', timeout=30000)
-                            await self.human_delay(2, 3)
+                            await self.human_delay(3, 5)
 
-                            # חפש תיבת תגובה בעמוד הפוסט
-                            comment_box = self.page.locator('div[contenteditable="true"][aria-label*="תגובה"], div[contenteditable="true"][aria-label*="comment"], div[role="textbox"][data-lexical-editor="true"]').first
-                            await comment_box.wait_for(state='visible', timeout=5000)
-                            await comment_box.click(timeout=3000)
-                            successful_method = "post page comment box"
+                            # נסה ללחוץ על כפתור תגובה
+                            comment_btn = self.page.locator(comment_btn_selector).first
+                            if await comment_btn.count() > 0:
+                                await comment_btn.click(timeout=3000)
+                                await self.human_delay(1, 2)
+
+                            # חיפוש תיבת טקסט
+                            textbox = self.page.locator(
+                                'div[role="textbox"][contenteditable="true"], '
+                                'div[contenteditable="true"][data-lexical-editor="true"], '
+                                'div[contenteditable="true"]'
+                            ).first
+                            await textbox.wait_for(state='visible', timeout=8000)
+                            await textbox.click(timeout=3000)
+                            comment_box = textbox
+                            successful_method = "post page"
                             print(f"   ✅ תיבת תגובה נמצאה! (שיטה: {successful_method})")
                         else:
                             print("      ❌ אין URL לפוסט")
@@ -544,12 +661,11 @@ class FacebookScraper:
                         print(f"      ❌ נכשל: {str(e)[:80]}")
 
                 if not comment_box or not successful_method:
-                    print("   ⚠️ לא נמצאה תיבת תגובה בכל השיטות, מדלג...")
-                    # צילום מסך כשנכשל
+                    print("   ⚠️ לא נמצאה תיבת תגובה, מדלג...")
                     try:
                         screenshot_failed = screenshot_dir / f"failed_{timestamp}.png"
                         await post['element'].screenshot(path=str(screenshot_failed))
-                        print(f"   📸 צילום מסך של כישלון נשמר: {screenshot_failed.name}")
+                        print(f"   📸 צילום מסך כישלון: {screenshot_failed.name}")
                     except:
                         pass
                     return False
@@ -562,39 +678,9 @@ class FacebookScraper:
                 await self.human_type(comment_box, response_text)
                 await self.human_delay(1, 1.5)
 
-                # שליחת התגובה - כפתור שליחה (לא Enter)
+                # שליחת התגובה - Enter שולח תגובה בפייסבוק
                 print("   📤 שולח תגובה...")
-                send_success = False
-
-                # נסה למצוא כפתור שליחה (אייקון חץ/מטוס נייר)
-                try:
-                    send_button_selectors = [
-                        'div[aria-label*="שלח"]',
-                        'div[aria-label*="Send"]',
-                        'button[aria-label*="Send"]',
-                        'button[type="submit"]',
-                        'div[aria-label*="submit"]',
-                        'div[aria-label*="Post"]',
-                        'div[aria-label*="פרסם"]',
-                        'div[role="button"][tabindex="0"]:near(div[contenteditable="true"])',
-                    ]
-                    for selector in send_button_selectors:
-                        try:
-                            send_btn = self.page.locator(selector).first
-                            if await send_btn.count() > 0:
-                                await send_btn.click(timeout=3000)
-                                send_success = True
-                                print("      ✅ נלחץ על כפתור שליחה")
-                                break
-                        except:
-                            continue
-                except Exception as e:
-                    print(f"      ⚠️ לא נמצא כפתור שליחה: {str(e)[:30]}")
-
-                if not send_success:
-                    print("      ❌ לא נמצא כפתור שליחה, מדלג על תגובה")
-                    return False
-
+                await comment_box.press('Enter')
                 await self.human_delay(3, 4)
 
                 # צילום מסך אחרי שליחה
@@ -688,8 +774,14 @@ class FacebookScraper:
     async def human_type(self, element, text: str):
         """הקלדה שנראית אנושית עם מהירות משתנה"""
         for char in text:
+            # בפייסבוק Enter שולח תגובה - נשתמש ב-Shift+Enter לשבירת שורה
+            if char == '\n':
+                await element.press('Shift+Enter')
+                await asyncio.sleep(random.uniform(0.2, 0.5))
+                continue
+
             await element.type(char, delay=random.randint(50, 150))
-            
+
             # סיכוי קטן לטעות ותיקון
             if random.random() < 0.03:  # 3% סיכוי
                 # הקלדת תו שגוי
@@ -699,7 +791,7 @@ class FacebookScraper:
                 # תיקון - backspace
                 await element.press('Backspace')
                 await asyncio.sleep(0.1)
-            
+
             # פעם בפעם - השהיית חשיבה
             if random.random() < 0.10:  # 10% סיכוי
                 await asyncio.sleep(random.uniform(0.3, 1.0))
@@ -713,10 +805,19 @@ class FacebookScraper:
             await asyncio.sleep(random.uniform(0.3, 0.8))
     
     async def close(self):
-        """סגירת הדפדפן"""
-        if self.page:
-            await self.page.context.close()
-            print("✅ דפדפן נסגר (הסשן נשמר)")
+        """סגירת הדפדפן וניקוי כל המשאבים"""
+        try:
+            if self.context:
+                await self.context.close()
+                self.context = None
+                self.page = None
+                print("✅ דפדפן נסגר (הסשן נשמר)")
+        except Exception as e:
+            print(f"⚠️ שגיאה בסגירת הדפדפן: {e}")
+        finally:
+            if self.playwright:
+                await self.playwright.stop()
+                self.playwright = None
 
 
 # פונקציה ראשית להרצה
@@ -732,29 +833,30 @@ async def run_scan_session():
             print("❌ לא הצלחנו להתחבר לפייסבוק")
             return
         
-        # סריקת כל הקבוצות
-        all_posts = []
-        for group_info in config.TARGET_GROUPS:
-            if not group_info.get('url'):
-                print(f"⚠️ דלג על קבוצה {group_info['name']} - אין URL")
-                continue
-            
+        # סריקת כל הקבוצות - עיבוד פוסטים בכל קבוצה מיד
+        # (אלמנטים הופכים ללא תקפים אחרי ניווט לעמוד אחר)
+        total_candidates = 0
+        total_responses = 0
+        groups_with_url = [g for g in config.TARGET_GROUPS if g.get('url')]
+        skipped = len(config.TARGET_GROUPS) - len(groups_with_url)
+        if skipped:
+            print(f"⚠️ דילוג על {skipped} קבוצות ללא URL")
+
+        for idx, group_info in enumerate(groups_with_url):
             posts = await scraper.scan_group(group_info)
-            all_posts.extend(posts)
-            
-            # עיכוב בין קבוצות
-            delay = random.randint(
-                config.AUTOMATION_SETTINGS['delay_between_groups_min'],
-                config.AUTOMATION_SETTINGS['delay_between_groups_max']
-            )
-            print(f"⏳ ממתין {delay} שניות לפני הקבוצה הבאה...")
-            await asyncio.sleep(delay)
-        
-        # עיבוד והגבה לכל הפוסטים
-        if all_posts:
-            await scraper.process_and_respond_to_posts(all_posts)
-        else:
-            print("⚠️ לא נמצאו פוסטים לעיבוד")
+
+            # עיבוד פוסטים מיד בזמן שאנחנו עדיין בעמוד הקבוצה
+            if posts:
+                await scraper.process_and_respond_to_posts(posts)
+
+            # עיכוב בין קבוצות (לא אחרי הקבוצה האחרונה)
+            if idx < len(groups_with_url) - 1:
+                delay = random.randint(
+                    config.AUTOMATION_SETTINGS['delay_between_groups_min'],
+                    config.AUTOMATION_SETTINGS['delay_between_groups_max']
+                )
+                print(f"⏳ ממתין {delay} שניות לפני הקבוצה הבאה...")
+                await asyncio.sleep(delay)
         
     except Exception as e:
         print(f"❌ שגיאה כללית: {e}")

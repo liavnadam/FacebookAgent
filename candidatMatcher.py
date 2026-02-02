@@ -174,6 +174,23 @@ class CandidateMatcher:
             "מספר טלפון",
             "להגיש מועמדות",
             "לשלוח קורות חיים ל",
+            # מגייסים/חברות מחפשות עובדים
+            "מחפש מישהו",
+            "מחפשת מישהו",
+            "מחפשים את",
+            "מחפשת את ה",
+            "מחפש אותך",
+            "מחפשת אותך",
+            "בואו לעבוד",
+            "בוא לעבוד",
+            "הצטרפו לצוות",
+            "הצטרפו אל",
+            "מיזם",
+            "שותפות",
+            "שותפים",
+            "עובדים/ות",
+            "מומחי",
+            "מומחיות",
         ]
 
         for pattern in employer_only_patterns:
@@ -194,6 +211,24 @@ class CandidateMatcher:
             if positive_keyword in post_text_check or positive_keyword in post_text:
                 matched_keywords.append(positive_keyword)
 
+        # ביטויים נוספים שמעידים על מחפש עבודה (לא מעסיק)
+        seeker_phrases = [
+            ("דרושה לי", "דרושה לי"),
+            ("חצי משרה", "חצי משרה"),
+            ("עבודה מהבית", "עבודה מהבית"),
+            ("ללא ניסיון", "ללא ניסיון"),
+            ("בלי ניסיון", "בלי ניסיון"),
+            ("מחפש עבודה", "מחפש עבודה (ביטוי)"),
+            ("מחפשת עבודה", "מחפשת עבודה (ביטוי)"),
+            ("מחפש משרה", "מחפש משרה (ביטוי)"),
+            ("מחפשת משרה", "מחפשת משרה (ביטוי)"),
+            ("מחפשת הזדמנות", "מחפשת הזדמנות"),
+            ("מחפש הזדמנות", "מחפש הזדמנות"),
+        ]
+        for phrase, label in seeker_phrases:
+            if phrase in post_text and label not in matched_keywords:
+                matched_keywords.append(label)
+
         # חישוב ציון
         if len(matched_keywords) == 0:
             return False, 0.0, []
@@ -212,15 +247,21 @@ class CandidateMatcher:
                 score += 0.5
 
         # בונוס אם הפוסט בגוף ראשון (אני מחפש, אני צריך)
-        first_person_patterns = ["אני מחפש", "אני צריך", "אני רוצה", "אני מעוניין", "אני זמין"]
+        first_person_patterns = ["אני מחפש", "אני צריך", "אני רוצה", "אני מעוניין", "אני זמין",
+                                 "אני מחפשת", "אני מעוניינת", "אני זמינה"]
         for pattern in first_person_patterns:
             if pattern in post_text:
                 score += 2.0
                 break
 
+        # בונוס אם מציינים גיל (בן/בת XX) - מחפשי עבודה מציינים גיל
+        age_pattern = re.search(r'\bבן\s+\d{2}\b|\bבת\s+\d{2}\b', post_text)
+        if age_pattern:
+            score += 1.5
+
         score = min(score, 10.0)  # מקסימום 10
 
-        is_candidate = score >= 5.0  # סף גבוה יותר של 5.0
+        is_candidate = score >= 4.0  # סף מותאם
 
         return is_candidate, score, matched_keywords
     

@@ -6,6 +6,7 @@ Production Ready - עם מנגנון retry והתאוששות משגיאות
 
 import asyncio
 import sys
+import shutil
 import argparse
 from datetime import datetime
 
@@ -249,13 +250,30 @@ def main():
         action='store_true',
         help='מצב דיבוג'
     )
-    
+
+    parser.add_argument(
+        '--reset-session',
+        action='store_true',
+        help='מחיקת סשן דפדפן ישן והתחברות מחדש'
+    )
+
     args = parser.parse_args()
-    
+
     # הצגת סטטיסטיקות
     if args.stats is not None:
         show_statistics(args.stats)
         return
+
+    # איפוס סשן דפדפן
+    if args.reset_session:
+        session_dir = config.DATA_DIR / "browser_session"
+        if session_dir.exists():
+            shutil.rmtree(session_dir)
+            print("✅ סשן ישן נמחק - תתבקש להתחבר מחדש בהרצה הבאה")
+        else:
+            print("ℹ️ אין סשן שמור למחוק")
+        if not args.run_once:
+            return
     
     # וידוא שהסביבה מוכנה
     setup_environment()
